@@ -1,0 +1,323 @@
+/*
+ * ============================================================
+ *  ESP2 — MASTER CONTROLLER  (Color Sorter & Brain)
+ *  MAC: 3C:8A:1F:AF:CF:98
+ *
+ *  Responsibilities:
+ *    - Read color sensor → sort balls via servo
+ *    - Read RED/GREEN buttons → manage 20s lock timer
+ *    - LCD1 (0x23) = User Interface  (colour choice, countdown)
+ *    - LCD2 (0x27) = System Status   (ESP1 operational feedback)
+ *    - Send selectedColour to ESP1 via ESP-NOW
+ *    - Receive status string from ESP1 and display on LCD2
+ *
+ *  ESP-NOW Peer: ESP1 → 5C:01:3B:34:3A:64
+ * ============================================================
+ */
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ── I2C ────────────────────────────────────────────────────
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// ── COLOR SENSOR ────────────────────────────────────────────
+#define S0 13
+#define S1 12
+#define S2 14
+#define S3 27
+#define sensorOut 26
+
+// ── SERVOS ──────────────────────────────────────────────────
+#define SERVO_COLOR_PIN 19   // sorts balls
+#define SERVO_BTN_PIN   18   // mirrors button selection
+
+// ── BUTTONS (pressed = LOW via INPUT_PULLUP) ─────────────────
+#define BTN_RED   32
+#define BTN_GREEN 33
+
+// ── LCDs ────────────────────────────────────────────────────
+LiquidCrystal_I2C lcdUI    (0x23, 16, 2);   // LCD1 — user interface
+LiquidCrystal_I2C lcdStatus(0x27, 16, 2);   // LCD2 — ESP1 status
+
+// ── SERVOS ──────────────────────────────────────────────────
+Servo myServo;      // color sorting  (pin 19)
+Servo selectServo;  // button mirror  (pin 18)
+
+// ── COLOR SENSOR READINGS ────────────────────────────────────
+int freqR = 0, freqG = 0, freqB = 0;
+
+// ── ESP-NOW ─────────────────────────────────────────────────
+uint8_t esp1MAC[] = {0x5C, 0x01, 0x3B, 0x34, 0x3A, 0x64};
+
+// Outgoing: tells ESP1 which colour was selected
+typedef struct OutgoingMsg {
+  uint8_t selectedColour;   // 0=none 1=RED 2=GREEN
+} OutgoingMsg;
+
+// Incoming: operational status from ESP1
+typedef struct IncomingStatus {
+  char line1[17];   // up to 16 chars + null
+  char line2[17];
+} IncomingStatus;
+
+OutgoingMsg   toSend;
+IncomingStatus esp1Status;
+volatile bool newStatusFromESP1 = false;
+
+// ── STATE MACHINE ────────────────────────────────────────────
+enum SystemState { AWAITING_SELECTION, LOCKED, SELECTING, SORTING };
+SystemState currentState = AWAITING_SELECTION;
+
+int selectedColour = 0;
+
+// ── TIMERS ──────────────────────────────────────────────────
+const unsigned long LOCK_DURATION_MS   = 20000;
+const unsigned long COLOR_CHECK_MS     = 1000;
+const unsigned long UI_REFRESH_MS      = 500;
+
+unsigned long lockStartTime       = 0;
+unsigned long lastColorCheck      = 0;
+unsigned long lastUIRefresh       = 0;
+unsigned long sortingDisplayUntil = 0;   // hold sorting msg on LCD2 for 3s
+int           lastCountdownShown  = -1;
+
+// ── ESP-NOW CALLBACKS ────────────────────────────────────────
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.print("[ESP-NOW TX] ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+}
+
+void onDataReceived(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len == sizeof(IncomingStatus)) {
+    memcpy(&esp1Status, data, sizeof(IncomingStatus));
+    newStatusFromESP1 = true;
+  }
+}
+
+// ── SEND COLOUR TO ESP1 ──────────────────────────────────────
+void sendColourToESP1() {
+  toSend.selectedColour = (uint8_t)selectedColour;
+  esp_now_send(esp1MAC, (uint8_t *)&toSend, sizeof(toSend));
+  Serial.printf("[TX] Sent colour %d to ESP1\n", selectedColour);
+}
+
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // ── I2C + LCDs ──────────────────────────────────────────
+  Wire.begin(SDA_PIN, SCL_PIN, 100000);
+
+  lcdUI.init();     lcdUI.backlight();     lcdUI.clear();
+  lcdStatus.init(); lcdStatus.backlight(); lcdStatus.clear();
+
+  lcdUI.setCursor(0,0); lcdUI.print("Welcome User!   ");
+  lcdUI.setCursor(0,1); lcdUI.print("Select: R or G  ");
+
+  lcdStatus.setCursor(0,0); lcdStatus.print("SYSTEM STATUS:  ");
+  lcdStatus.setCursor(0,1); lcdStatus.print("Waiting ESP1... ");
+
+  // ── COLOR SENSOR ────────────────────────────────────────
+  pinMode(S0, OUTPUT); pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT); pinMode(S3, OUTPUT);
+  pinMode(sensorOut, INPUT);
+  digitalWrite(S0, LOW); digitalWrite(S1, HIGH); // 20% scaling
+
+  // ── BUTTONS ─────────────────────────────────────────────
+  pinMode(BTN_RED,   INPUT_PULLUP);
+  pinMode(BTN_GREEN, INPUT_PULLUP);
+
+  // ── SERVOS ──────────────────────────────────────────────
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  myServo.setPeriodHertz(50);
+  myServo.attach(SERVO_COLOR_PIN, 500, 2400);
+  myServo.write(78);
+
+  selectServo.setPeriodHertz(50);
+  selectServo.attach(SERVO_BTN_PIN, 500, 2400);
+  selectServo.write(90);
+
+  // ── ESP-NOW ─────────────────────────────────────────────
+  WiFi.mode(WIFI_STA);
+  Serial.print("ESP2 MAC: "); Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ERROR] ESP-NOW init failed");
+    lcdStatus.setCursor(0,1); lcdStatus.print("ESP-NOW FAILED! ");
+    return;
+  }
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataReceived);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, esp1MAC, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("[ERROR] Failed to add ESP1 peer");
+  }
+
+  Serial.println("--- ESP2 Master Ready ---");
+}
+
+// ============================================================
+void loop() {
+  unsigned long now = millis();
+
+  // ── UPDATE LCD2 WITH ESP1 STATUS ────────────────────────
+  // Do not overwrite LCD2 while ESP2 itself is actively sorting a ball
+  if (newStatusFromESP1 && currentState != SORTING) {
+    newStatusFromESP1 = false;
+    lcdStatus.clear();
+    lcdStatus.setCursor(0,0); lcdStatus.print(esp1Status.line1);
+    lcdStatus.setCursor(0,1); lcdStatus.print(esp1Status.line2);
+  }
+
+  // ════════════════════════════════════════════════════════
+  // STATE 1: AWAITING FIRST COLOUR SELECTION
+  // ════════════════════════════════════════════════════════
+  if (currentState == AWAITING_SELECTION) {
+    if (digitalRead(BTN_RED) == LOW) {
+      selectedColour = 1;
+      selectServo.write(180);
+      currentState   = LOCKED;
+      lockStartTime  = now;
+      lastCountdownShown = -1;
+      sendColourToESP1();
+      delay(200);
+    }
+    else if (digitalRead(BTN_GREEN) == LOW) {
+      selectedColour = 2;
+      selectServo.write(0);
+      currentState   = LOCKED;
+      lockStartTime  = now;
+      lastCountdownShown = -1;
+      sendColourToESP1();
+      delay(200);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════
+  // STATE 2: LOCKED — countdown on LCD1, buttons ignored
+  // ════════════════════════════════════════════════════════
+  if (currentState == LOCKED) {
+    unsigned long elapsed = now - lockStartTime;
+
+    if (elapsed >= LOCK_DURATION_MS) {
+      currentState = SELECTING;
+      lastCountdownShown = -1;
+      Serial.println("[LOCK] Expired — buttons unlocked.");
+      lcdUI.clear();
+      lcdUI.setCursor(0,0); lcdUI.print("Change colour?  ");
+      lcdUI.setCursor(0,1); lcdUI.print("Press RED or GRN");
+    }
+    else {
+      int secsLeft = (int)((LOCK_DURATION_MS - elapsed + 999) / 1000);
+      if (secsLeft != lastCountdownShown) {
+        lastCountdownShown = secsLeft;
+        lcdUI.clear();
+        lcdUI.setCursor(0,0);
+        lcdUI.print(selectedColour == 1 ? "Colour: RED     " : "Colour: GREEN   ");
+        lcdUI.setCursor(0,1);
+        char buf[17];
+        snprintf(buf, sizeof(buf), "Locked  [%2ds]   ", secsLeft);
+        lcdUI.print(buf);
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════
+  // STATE 3 / 4: SELECTING / SORTING — post-lock button input
+  // ════════════════════════════════════════════════════════
+  if (currentState == SELECTING || currentState == SORTING) {
+    if (digitalRead(BTN_RED) == LOW) {
+      selectedColour = 1;
+      selectServo.write(180);
+      sendColourToESP1();
+      lcdUI.clear();
+      lcdUI.setCursor(0,0); lcdUI.print("Colour: RED     ");
+      lcdUI.setCursor(0,1); lcdUI.print("                ");
+      delay(200);
+    }
+    else if (digitalRead(BTN_GREEN) == LOW) {
+      selectedColour = 2;
+      selectServo.write(0);
+      sendColourToESP1();
+      lcdUI.clear();
+      lcdUI.setCursor(0,0); lcdUI.print("Colour: GREEN   ");
+      lcdUI.setCursor(0,1); lcdUI.print("                ");
+      delay(200);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════
+  // COLOR SENSOR — non-blocking, every 1 second
+  // ════════════════════════════════════════════════════════
+  if (now - lastColorCheck >= COLOR_CHECK_MS) {
+    lastColorCheck = now;
+
+    digitalWrite(S2, LOW);  digitalWrite(S3, LOW);
+    freqR = pulseIn(sensorOut, LOW); delay(10);
+
+    digitalWrite(S2, HIGH); digitalWrite(S3, HIGH);
+    freqG = pulseIn(sensorOut, LOW); delay(10);
+
+    digitalWrite(S2, LOW);  digitalWrite(S3, HIGH);
+    freqB = pulseIn(sensorOut, LOW); delay(10);
+
+    Serial.printf("Sensor R=%d G=%d B=%d\n", freqR, freqG, freqB);
+
+    if (freqR < freqG && freqR < 35) {
+      myServo.write(68);
+      Serial.println("-> RED ball detected");
+      currentState        = SORTING;
+      sortingDisplayUntil = millis() + 3000;
+      lcdStatus.clear();
+      lcdStatus.setCursor(0,0); lcdStatus.print("SORTING BALL... ");
+      lcdStatus.setCursor(0,1); lcdStatus.print("Detected: RED   ");
+    }
+    else if (freqG < freqR && freqG < 30) {
+      myServo.write(88);
+      Serial.println("-> GREEN ball detected");
+      currentState        = SORTING;
+      sortingDisplayUntil = millis() + 3000;
+      lcdStatus.clear();
+      lcdStatus.setCursor(0,0); lcdStatus.print("SORTING BALL... ");
+      lcdStatus.setCursor(0,1); lcdStatus.print("Detected: GREEN ");
+    }
+    else {
+      myServo.write(78);
+      if (currentState == SORTING && millis() >= sortingDisplayUntil) {
+        currentState = SELECTING;
+        lcdStatus.clear();
+        lcdStatus.setCursor(0,0); lcdStatus.print("SYSTEM STATUS:  ");
+        lcdStatus.setCursor(0,1); lcdStatus.print("Selecting...    ");
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════
+  // IDLE LCD1 REFRESH (rate-limited, no flicker)
+  // ════════════════════════════════════════════════════════
+  if (currentState != LOCKED && (now - lastUIRefresh >= UI_REFRESH_MS)) {
+    lastUIRefresh = now;
+    if (currentState == AWAITING_SELECTION) {
+      lcdUI.setCursor(0,0); lcdUI.print("Welcome User!   ");
+      lcdUI.setCursor(0,1); lcdUI.print("Select: R or G  ");
+    }
+    else if (currentState == SELECTING) {
+      lcdUI.setCursor(0,0);
+      if      (selectedColour == 1) lcdUI.print("Colour: RED     ");
+      else if (selectedColour == 2) lcdUI.print("Colour: GREEN   ");
+      else                          lcdUI.print("Change colour?  ");
+      lcdUI.setCursor(0,1); lcdUI.print("Press RED or GRN");
+    }
+  }
+}
