@@ -8,7 +8,7 @@ Developed as the Final Project for the **Basics of Mechatronics (MCT231)** cours
 
 ---
 
-## 👥 Mission Control Team (Team #2)
+## 👥 Mission Control Team (Team #16)
 * **Ziad Atef M. Riad** - ID: 24P0103
 * **Kamal Wahdan** - ID: 24P0222
 * **Zeyad Amr Nazih** - ID: 24P0372
