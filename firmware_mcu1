@@ -1,0 +1,214 @@
+/*
+ * ============================================================
+ *  ESP1 — SLAVE SUBSYSTEM  (Lifter & Shooter)
+ *  MAC: 5C:01:3B:34:3A:64
+ *
+ *  Responsibilities:
+ *    - Wait for IR_BOTTOM → lift ball with stepper motor
+ *    - Wait for IR_TOP    → fire shooting motors
+ *    - Receive selectedColour from ESP2 via ESP-NOW
+ *    - Broadcast real-time status strings back to ESP2
+ *      so ESP2 can display them on LCD2 (0x27)
+ *
+ *  ESP-NOW Peer: ESP2 → 3C:8A:1F:AF:CF:98
+ * ============================================================
+ */
+
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ── STEPPER (A4988 / DRV8825) ────────────────────────────────
+#define STEP_PIN   18
+#define DIR_PIN    19
+#define ENABLE_PIN 32     // LOW = enabled, HIGH = disabled
+
+// ── IR SENSORS (LOW = ball detected) ────────────────────────
+#define IR_BOTTOM 27
+#define IR_TOP    33
+
+// ── SHOOTING MOTORS (L298N) ──────────────────────────────────
+#define IN1 14
+#define IN2 12
+#define IN3 13
+#define IN4 15
+#define ENA 25
+#define ENB 26
+
+// ── SHOOTING SPEED (0–255) ────────────────────────────────────
+int shootSpeed = 200;
+
+// ── STATE ────────────────────────────────────────────────────
+bool lifting  = false;
+bool shooting = false;
+
+unsigned long shootStartTime = 0;
+const unsigned long SHOOT_DURATION_MS = 1000;  // motors run 1 s
+
+// ── ESP-NOW ──────────────────────────────────────────────────
+uint8_t esp2MAC[] = {0x3C, 0x8A, 0x1F, 0xAF, 0xCF, 0x98};
+
+// Incoming: colour chosen on ESP2
+typedef struct IncomingColour {
+  uint8_t selectedColour;  // 1=RED 2=GREEN 0=none
+} IncomingColour;
+
+// Outgoing: status lines for ESP2's LCD2
+typedef struct StatusMsg {
+  char line1[17];
+  char line2[17];
+} StatusMsg;
+
+IncomingColour receivedData;
+volatile bool  newColourReceived = false;
+uint8_t        currentColour = 0;
+
+// ── HELPERS ──────────────────────────────────────────────────
+void sendStatus(const char *l1, const char *l2) {
+  StatusMsg msg;
+  strncpy(msg.line1, l1, 16); msg.line1[16] = '\0';
+  strncpy(msg.line2, l2, 16); msg.line2[16] = '\0';
+  esp_now_send(esp2MAC, (uint8_t *)&msg, sizeof(msg));
+  Serial.printf("[TX Status] '%s' | '%s'\n", msg.line1, msg.line2);
+}
+
+void stopShooter() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void startShooter() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, shootSpeed);
+  analogWrite(ENB, shootSpeed);
+}
+
+void enableStepper()  { digitalWrite(ENABLE_PIN, LOW);  }
+void disableStepper() { digitalWrite(ENABLE_PIN, HIGH); }
+
+void stepOnce() {
+  digitalWrite(STEP_PIN, HIGH); delayMicroseconds(1500);
+  digitalWrite(STEP_PIN, LOW);  delayMicroseconds(1500);
+}
+
+// ── ESP-NOW CALLBACKS ────────────────────────────────────────
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  // silent — status TX confirmations not needed
+}
+
+void onDataReceived(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len == sizeof(IncomingColour)) {
+    memcpy(&receivedData, data, sizeof(IncomingColour));
+    newColourReceived = true;
+  }
+}
+
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // ── STEPPER ──────────────────────────────────────────────
+  pinMode(STEP_PIN,   OUTPUT);
+  pinMode(DIR_PIN,    OUTPUT);
+  pinMode(ENABLE_PIN, OUTPUT);
+  digitalWrite(DIR_PIN,    LOW);
+  disableStepper();   // off at boot
+
+  // ── IR SENSORS ───────────────────────────────────────────
+  pinMode(IR_BOTTOM, INPUT);
+  pinMode(IR_TOP,    INPUT);
+
+  // ── SHOOTER MOTORS ───────────────────────────────────────
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  stopShooter();
+
+  // ── ESP-NOW ──────────────────────────────────────────────
+  WiFi.mode(WIFI_STA);
+  Serial.print("ESP1 MAC: "); Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ERROR] ESP-NOW init failed");
+    return;
+  }
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataReceived);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, esp2MAC, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("[ERROR] Failed to add ESP2 peer");
+  }
+
+  sendStatus("ESP1 ONLINE     ", "Awaiting ball...");
+  Serial.println("--- ESP1 Slave Ready ---");
+}
+
+// ============================================================
+void loop() {
+  unsigned long now = millis();
+
+  // ── HANDLE NEW COLOUR FROM ESP2 ──────────────────────────
+  if (newColourReceived) {
+    newColourReceived = false;
+    currentColour = receivedData.selectedColour;
+    const char *colName = (currentColour == 1) ? "RED" : (currentColour == 2) ? "GREEN" : "NONE";
+    Serial.printf("[RX] Colour received: %s\n", colName);
+
+    char l2[17];
+    snprintf(l2, sizeof(l2), "Target: %-6s  ", colName);
+    sendStatus("SYSTEM STATUS:  ", l2);
+  }
+
+  // ════════════════════════════════════════════════════════
+  // LIFTING — triggered by IR_BOTTOM
+  // ════════════════════════════════════════════════════════
+  int bottomSensor = digitalRead(IR_BOTTOM);
+  int topSensor    = digitalRead(IR_TOP);
+
+  if (bottomSensor == LOW && !lifting && !shooting) {
+    lifting = true;
+    enableStepper();
+    Serial.println("[IR_BOTTOM] Ball detected → lifting");
+    sendStatus("SYSTEM STATUS:  ", "Lifting ball... ");
+  }
+
+  if (lifting) {
+    stepOnce();   // non-blocking single step each loop pass
+  }
+
+  // ════════════════════════════════════════════════════════
+  // TOP REACHED — stop lift, fire shooter
+  // ════════════════════════════════════════════════════════
+  if (topSensor == LOW && lifting) {
+    lifting = false;
+    disableStepper();
+    Serial.println("[IR_TOP] Ball at top → shooting");
+
+    shooting       = true;
+    shootStartTime = now;
+    startShooter();
+
+    // Report which colour is being shot
+    const char *colName = (currentColour == 1) ? "RED" : (currentColour == 2) ? "GREEN" : "BALL";
+    char l2[17];
+    snprintf(l2, sizeof(l2), "Shooting %-6s ", colName);
+    sendStatus("SYSTEM STATUS:  ", l2);
+  }
+
+  // ════════════════════════════════════════════════════════
+  // SHOOT TIMEOUT — stop motors after SHOOT_DURATION_MS
+  // ════════════════════════════════════════════════════════
+  if (shooting && (now - shootStartTime >= SHOOT_DURATION_MS)) {
+    shooting = false;
+    stopShooter();
+    Serial.println("[SHOOT] Done → idle");
+    sendStatus("SYSTEM STATUS:  ", "Awaiting ball...");
+  }
+}
